@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Vellum\Markdown\Extensions\Directive;
 
+use League\CommonMark\Extension\CommonMark\Node\Block\FencedCode;
 use League\CommonMark\Node\Block\AbstractBlock;
 use League\CommonMark\Node\Node;
 use League\CommonMark\Parser\Block\AbstractBlockContinueParser;
@@ -44,10 +45,14 @@ final class DirectiveContinueParser extends AbstractBlockContinueParser
             return BlockContinue::at($cursor);
         }
 
-        $cursor->advanceToNextNonSpaceOrTab();
-        $remainder = trim($cursor->getRemainder());
+        // Looked at, not consumed: the spaces a line opens with belong to what
+        // is inside, and a code block indented by two would lose them.
+        if (trim($cursor->getRemainder()) === ':::') {
+            // Inside a fenced block it is a line of code like any other.
+            if ($activeBlockParser->getBlock() instanceof FencedCode) {
+                return BlockContinue::at($cursor);
+            }
 
-        if ($remainder === ':::') {
             // CommonMark asks outer containers first. Do not close while a nested
             // directive is still open between this block and the tip.
             if ($this->hasOpenNestedDirective($activeBlockParser->getBlock())) {

@@ -248,6 +248,67 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | API reference
+    |--------------------------------------------------------------------------
+    |
+    | Reference pages generated from an OpenAPI 3.0 or 3.1 spec: one page per
+    | operation, in a sidebar folder per tag, under {route.prefix}/{prefix}.
+    |
+    | spec: path to a JSON or YAML file. Leave it null to have Scramble write
+    | one, when dedoc/scramble is installed.
+    |
+    | scramble: set to false to never ask Scramble.
+    |
+    | watch: the directories whose PHP files Scramble reads. In local
+    | development the reference is built again when one of them changes.
+    | Null watches app/ and routes/.
+    |
+    | sidebar: separate gives the reference a sidebar of its own, with a
+    | switch between it and the docs at the top of both. docs lists it as one
+    | more folder at the end of the docs' sidebar.
+    |
+    | title: the name of the reference in the sidebar, and of its overview.
+    |
+    | group_by: tag, or path to group by the first segment of the path.
+    |
+    | untagged_label: the folder for operations without a tag.
+    |
+    | samples: languages of the request samples, in tab order. curl, php and
+    | javascript are built in.
+    |
+    | base_url: used in the samples in place of the spec's first server.
+    |
+    | playground: lets a reader send an operation's request from its page
+    | and see the response. Requests go from the reader's browser.
+    |
+    | proxy: sends a playground request to another origin through this app,
+    | for an API that does not let a browser on the docs' origin read its
+    | answers. Only the servers the spec names can be reached, and only at
+    | a public address unless proxy_private allows a private network.
+    |
+    | access: who may read the reference, as for a page's access frontmatter.
+    |
+    */
+    'openapi' => [
+        'enabled' => env('VELLUM_OPENAPI', false),
+        'spec' => env('VELLUM_OPENAPI_SPEC'),
+        'scramble' => true,
+        'watch' => null,
+        'prefix' => 'api',
+        'sidebar' => 'separate',
+        'title' => 'API reference',
+        'group_by' => 'tag',
+        'untagged_label' => 'Other',
+        'samples' => ['curl', 'php', 'javascript'],
+        'base_url' => null,
+        'playground' => true,
+        'proxy' => env('VELLUM_OPENAPI_PROXY', false),
+        'proxy_private' => env('VELLUM_OPENAPI_PROXY_PRIVATE', false),
+        'access' => 'guest',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Changelog
     |--------------------------------------------------------------------------
     |
