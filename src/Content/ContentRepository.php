@@ -6,15 +6,15 @@ namespace Vellum\Content;
 
 use Vellum\Cache\CompiledStore;
 use Vellum\Cache\FragmentCache;
+use Vellum\CoreServiceProvider;
 use Vellum\Exceptions\DuplicateSlugException;
 use Vellum\Exceptions\UnknownDirectiveException;
+use Vellum\Markdown\CompiledLabels;
 use Vellum\Markdown\Islands\IslandRenderer;
 use Vellum\Markdown\Islands\MarkdownPipeline;
 use Vellum\Markdown\MarkdownRenderer;
-use Vellum\OpenApi\Mount;
-use Vellum\OpenApi\OpenApiPages;
-use Vellum\OpenApi\SpecSource;
 use Vellum\Search\SearchVisibility;
+use Vellum\Site;
 use Vellum\Support\Slug;
 use Vellum\Support\Str;
 use Vellum\Support\VersionUrl;
@@ -24,22 +24,48 @@ use Vellum\Support\VersionUrl;
  */
 final class ContentRepository
 {
+    private readonly string $contentPath;
+
+    private readonly CompiledStore $store;
+
+    private readonly MarkdownPipeline $pipeline;
+
+    private readonly bool $versionsEnabled;
+
+    private readonly ?string $latestVersion;
+
+    /** @var list<string> */
+    private readonly array $versions;
+
+    private readonly bool $isLocal;
+
+    private readonly string $routePrefix;
+
+    /**
+     * Everything the repository needs to know comes from the site it is
+     * given. The store and the pipeline can be handed in, for a test that
+     * wants to look inside them; otherwise they are made from the site.
+     */
     public function __construct(
-        private readonly string $contentPath,
-        private readonly CompiledStore $store,
+        private readonly Site $site,
+        ?CompiledStore $store = null,
         private readonly FrontMatterParser $frontMatterParser = new FrontMatterParser,
-        private readonly MarkdownPipeline $pipeline = new MarkdownPipeline,
-        private readonly bool $versionsEnabled = false,
-        private readonly ?string $latestVersion = null,
-        /** @var list<string> */
-        private readonly array $versions = [],
-        private readonly bool $isLocal = false,
-        private readonly string $routePrefix = 'docs',
+        ?MarkdownPipeline $pipeline = null,
         private readonly Access $access = new Access,
         private readonly SearchVisibility $visibility = new SearchVisibility,
         private readonly ImageReport $imageReport = new ImageReport,
-        private readonly ?OpenApiPages $openApi = null,
-    ) {}
+        /** @var list<PageSource> */
+        private readonly array $sources = [],
+    ) {
+        $this->contentPath = $site->contentPath;
+        $this->store = $store ?? new CompiledStore($site->cachePath);
+        $this->versionsEnabled = $site->versions->enabled;
+        $this->latestVersion = $site->versions->latest;
+        $this->versions = $site->versions->list;
+        $this->isLocal = $site->isLocal;
+        $this->routePrefix = $site->routePrefix;
+        $this->pipeline = $pipeline ?? $this->newPipeline($this->contentPath, null);
+    }
 
     /**
      * Pipelines keyed by version folder. Images resolve against the version
@@ -60,30 +86,28 @@ final class ContentRepository
     private array $navigationTrees = [];
 
     /**
-     * Build a repository from Laravel config values.
+     * A repository built from the app's config as it is now. Inside a request,
+     * prefer resolving ContentRepository from the container, which builds one
+     * per request and shares it.
      */
     public static function fromConfig(): self
     {
-        /** @var array{enabled?: bool, latest?: string, list?: list<string>} $versions */
-        $versions = config('vellum.versions', []);
-        $imageReport = new ImageReport;
+        return CoreServiceProvider::repository(app(), CoreServiceProvider::site(app()));
+    }
 
-        return new self(
-            contentPath: (string) config('vellum.path'),
-            store: new CompiledStore((string) config('vellum.cache.path')),
-            pipeline: new MarkdownPipeline(new MarkdownRenderer(
-                contentPath: (string) config('vellum.path'),
-                appUrl: (string) config('app.url', ''),
-                imageReport: $imageReport,
-            )),
-            versionsEnabled: (bool) ($versions['enabled'] ?? false),
-            latestVersion: $versions['latest'] ?? null,
-            versions: $versions['list'] ?? [],
-            isLocal: app()->environment('local'),
-            routePrefix: (string) config('vellum.route.prefix', 'docs'),
-            imageReport: $imageReport,
-            openApi: SpecSource::enabled() ? new OpenApiPages : null,
-        );
+    public function site(): Site
+    {
+        return $this->site;
+    }
+
+    /**
+     * The names of the sources of generated pages this repository has.
+     *
+     * @return list<string>
+     */
+    public function sourceNames(): array
+    {
+        return array_map(static fn (PageSource $source): string => $source->name(), $this->sources);
     }
 
     public function store(): CompiledStore
@@ -186,88 +210,133 @@ final class ContentRepository
     }
 
     /**
-     * The tree for the sidebar of one page. That is navigation(), unless the
-     * API reference has a sidebar to itself: then a reference page gets the
-     * reference alone, and every other page gets the docs without it.
+     * The tree for the sidebar of one page. That is navigation(), unless a
+     * folder has a sidebar to itself: a top-level folder whose meta.json says
+     * `root`, or the folder of a source of generated pages that asks for one,
+     * as the API reference can. Then a page in that folder gets the folder
+     * alone, and every other page gets the docs without any of them.
      *
      * @return list<array<string, mixed>>
      */
     public function sidebar(?string $slug, ?string $version = null): array
     {
         $tree = $this->navigation($version);
-        $index = $this->referenceIndex($tree);
+        $separate = $this->separateFolders($tree);
 
-        if ($index === null) {
-            return $tree;
+        foreach ($separate as $index) {
+            if ($this->holdsPage($tree[$index], $slug)) {
+                /** @var list<array<string, mixed>> $children */
+                $children = $tree[$index]['children'];
+
+                return $children;
+            }
         }
 
-        if ($this->holdsPage($tree[$index], $slug)) {
-            /** @var list<array<string, mixed>> $children */
-            $children = $tree[$index]['children'];
-
-            return $children;
+        foreach ($separate as $index) {
+            unset($tree[$index]);
         }
-
-        unset($tree[$index]);
 
         return array_values($tree);
     }
 
     /**
      * The sidebars a reader can switch between, with the one this page is in
-     * marked. Empty when there is only one.
+     * marked: the docs' own first, then each folder with a sidebar of its own
+     * in the order the sidebar lists them. A folder this reader may open no
+     * page of is left out. Empty when there is only one.
      *
-     * @return list<array{key: string, title: string, href: string, current: bool}>
+     * @return list<array{key: string, title: string, description: string|null, href: string, current: bool}>
      */
     public function sections(?string $slug, ?string $version = null): array
     {
         $tree = $this->navigation($version);
-        $index = $this->referenceIndex($tree);
+        $others = [];
 
-        if ($index === null) {
+        foreach ($this->separateFolders($tree) as $key => $index) {
+            $folder = $tree[$index];
+            $first = $this->navigationBuilder()->flattenPages([$folder])[0] ?? null;
+
+            if ($first === null) {
+                continue;
+            }
+
+            $title = $folder['title'] ?? null;
+            $description = $folder['description'] ?? null;
+            $others[] = [
+                'key' => $key,
+                'title' => is_string($title) && $title !== '' ? $title : $key,
+                'description' => is_string($description) ? $description : null,
+                'href' => $first['href'],
+                'current' => $this->holdsPage($folder, $slug),
+            ];
+        }
+
+        if ($others === []) {
             return [];
         }
 
-        $reference = $tree[$index];
-        $first = $this->navigationBuilder()->flattenPages([$reference])[0] ?? null;
-
-        if ($first === null) {
-            return [];
-        }
-
-        $inReference = $this->holdsPage($reference, $slug);
-        $title = $reference['title'] ?? null;
+        $inOther = in_array(true, array_column($others, 'current'), true);
 
         return [
-            ['key' => 'docs', 'title' => 'Docs', 'href' => $this->hrefFor('', $version), 'current' => ! $inReference],
             [
-                'key' => 'api',
-                'title' => is_string($title) && $title !== '' ? $title : 'API reference',
-                'href' => $first['href'],
-                'current' => $inReference,
+                'key' => '',
+                'title' => $this->navigationBuilder()->title($this->resolveVersion($version)),
+                'description' => null,
+                'href' => $this->hrefFor('', $version),
+                'current' => ! $inOther,
             ],
+            ...$others,
         ];
     }
 
     /**
-     * Where the reference's folder sits in a tree, when it is to have a
-     * sidebar of its own and this reader may see it.
+     * Where the folders with a sidebar of their own sit in a tree, by their
+     * key: the folder name for a root, the source's name for generated pages.
      *
      * @param  list<array<string, mixed>>  $tree
+     * @return array<string, int>
      */
-    private function referenceIndex(array $tree): ?int
+    private function separateFolders(array $tree): array
     {
-        if ($this->openApi === null || ! Mount::separate()) {
-            return null;
+        $separate = [];
+        $sources = [];
+
+        foreach ($this->sources as $source) {
+            $sources[$source->name()] = $source->separate();
         }
 
         foreach ($tree as $index => $node) {
-            if (($node['section'] ?? null) === 'api' && is_array($node['children'] ?? null)) {
-                return $index;
+            $key = $node['section'] ?? null;
+
+            if (! is_string($key) || ! is_array($node['children'] ?? null)) {
+                continue;
+            }
+
+            if (($node['root'] ?? false) === true || ($sources[$key] ?? false)) {
+                $separate[$key] = $index;
             }
         }
 
-        return null;
+        return $separate;
+    }
+
+    /**
+     * Folders below the top level that ask to be a root, by version, for the
+     * build to report.
+     *
+     * @return list<string>
+     */
+    public function misplacedRoots(): array
+    {
+        $found = [];
+
+        foreach ($this->versionsEnabled ? $this->versions : [null] as $version) {
+            foreach ($this->navigationBuilder()->misplacedRoots($version) as $path) {
+                $found[] = $version === null ? $path : $version.'/'.$path;
+            }
+        }
+
+        return $found;
     }
 
     /**
@@ -308,7 +377,7 @@ final class ContentRepository
             $stored !== null
             && $manifest !== null
             && $manifest['directory_hash'] === $this->navigationBuilder()->directoryHash($version)
-            && ($manifest['openapi'] ?? null) === $this->generatedSignature($version)
+            && ($manifest['sources'] ?? []) === $this->signatures($version)
         ) {
             return $stored;
         }
@@ -340,11 +409,29 @@ final class ContentRepository
      */
     public function breadcrumbs(Document $document): array
     {
-        return $this->navigationBuilder()->breadcrumbs(
-            $this->navigation($document->version),
-            $document->slug,
-            $document->title,
-        );
+        $tree = $this->navigation($document->version);
+
+        // A page in a folder with a sidebar of its own starts at that folder.
+        foreach ($this->separateFolders($tree) as $index) {
+            $folder = $tree[$index];
+
+            if (! $this->holdsPage($folder, $document->slug)) {
+                continue;
+            }
+
+            /** @var list<array<string, mixed>> $children */
+            $children = $folder['children'];
+            $first = $this->navigationBuilder()->flattenPages($children)[0] ?? null;
+            $title = $folder['title'] ?? null;
+
+            return $this->navigationBuilder()->breadcrumbs($children, $document->slug, $document->title, [
+                'title' => is_string($title) ? $title : '',
+                'href' => $first['href'] ?? null,
+                'slug' => $first['slug'] ?? null,
+            ]);
+        }
+
+        return $this->navigationBuilder()->breadcrumbs($tree, $document->slug, $document->title);
     }
 
     /**
@@ -376,12 +463,14 @@ final class ContentRepository
             $this->store->put($document);
         }
 
-        $group = $this->generated($version) === []
-            ? null
-            : $this->openApi?->navGroup($version, fn (string $slug): string => $this->hrefFor($slug, $version));
+        foreach ($this->carriedSources($version) as $source) {
+            $href = fn (string $slug): string => $this->hrefFor($slug, $version);
+            $folder = $source->documents($version, $href) === [] ? null : $source->navigation($version, $href);
 
-        if ($group !== null) {
-            $tree[] = $group;
+            if ($folder !== null) {
+                // Marked with the source, so it can be given a sidebar of its own.
+                $tree[] = ['type' => $folder['type'] ?? 'folder', 'section' => $source->name()] + $folder;
+            }
         }
 
         $this->store->putNav($tree, $version);
@@ -391,40 +480,68 @@ final class ContentRepository
             'version' => $version,
             // Every page compiled, so production can serve only these.
             'complete' => $complete,
-            'openapi' => $this->generatedSignature($version),
+            'sources' => $this->signatures($version),
         ], $version);
     }
 
     /**
-     * Pages generated from an OpenAPI spec. The spec is not versioned, so
-     * they belong to the latest version only and are not copied into the
-     * others.
+     * Pages from the sources of generated pages. What they are built from is
+     * not versioned, so they belong to the latest version only and are not
+     * copied into the others.
      *
      * @return list<Document>
      */
     private function generated(?string $version): array
     {
-        if ($this->openApi === null || ! $this->carriesGenerated($version)) {
-            return [];
+        $documents = [];
+
+        foreach ($this->carriedSources($version) as $source) {
+            array_push($documents, ...$source->documents($version, fn (string $slug): string => $this->hrefFor($slug, $version)));
         }
 
-        return $this->openApi->documents($version, fn (string $slug): string => $this->hrefFor($slug, $version));
+        return $documents;
     }
 
     /**
-     * What the spec reader had to work around: a reference it could not
-     * follow, a spec it could not find. For the build to print.
+     * What the sources had to work around: a reference it could not follow,
+     * a spec it could not find. For the build to print.
      *
      * @return list<string>
      */
     public function generatedWarnings(): array
     {
-        return $this->openApi?->warnings() ?? [];
+        $warnings = [];
+
+        foreach ($this->sources as $source) {
+            array_push($warnings, ...$source->warnings());
+        }
+
+        return $warnings;
     }
 
-    private function generatedSignature(?string $version): ?string
+    /**
+     * Each source's signature, by name, as a build records it in the
+     * manifest. A version that carries no generated pages records null.
+     *
+     * @return array<string, string|null>
+     */
+    private function signatures(?string $version): array
     {
-        return $this->openApi !== null && $this->carriesGenerated($version) ? $this->openApi->signature() : null;
+        $signatures = [];
+
+        foreach ($this->sources as $source) {
+            $signatures[$source->name()] = $this->carriesGenerated($version) ? $source->signature() : null;
+        }
+
+        return $signatures;
+    }
+
+    /**
+     * @return list<PageSource>
+     */
+    private function carriedSources(?string $version): array
+    {
+        return $this->carriesGenerated($version) ? $this->sources : [];
     }
 
     private function carriesGenerated(?string $version): bool
@@ -432,11 +549,21 @@ final class ContentRepository
         return ! $this->versionsEnabled || $version === null || $version === $this->latestVersion;
     }
 
+    private function sourceFor(string $slug): ?PageSource
+    {
+        foreach ($this->sources as $source) {
+            if ($source->owns($slug)) {
+                return $source;
+            }
+        }
+
+        return null;
+    }
+
     /**
-     * Whether a generated page in the store is still one the spec describes.
-     * Production serves what the build wrote. Local compares the page with
-     * the spec as the sidebar last saw it, so an endpoint that was removed
-     * stops answering.
+     * Whether a generated page in the store is still one its source would
+     * build. Production serves what the build wrote. Local asks the source,
+     * so an endpoint that was removed from a spec stops answering.
      */
     private function generatedIsCurrent(Document $document, ?string $version): bool
     {
@@ -444,9 +571,9 @@ final class ContentRepository
             return true;
         }
 
-        $signature = $this->generatedSignature($version);
+        $source = $this->sourceFor($document->slug);
 
-        return $signature !== null && ($document->frontmatter['openapi_signature'] ?? null) === $signature;
+        return $source !== null && $this->carriesGenerated($version) && $source->isCurrent($document);
     }
 
     /**
@@ -486,10 +613,11 @@ final class ContentRepository
      */
     public function render(Document $document, bool $cache = true): string
     {
-        $render = static fn (): string => (new IslandRenderer)->render($document->html, $document->islands);
-        $html = $cache ? (new FragmentCache)->remember($document, $render) : $render();
+        $components = $this->site->components;
+        $render = static fn (): string => (new IslandRenderer($components))->render($document->html, $document->islands);
+        $html = $cache ? (new FragmentCache($components))->remember($document, $render) : $render();
 
-        return $this->describeCards($html, $document->version);
+        return CompiledLabels::translate($this->describeCards($html, $document->version));
     }
 
     /**
@@ -545,12 +673,11 @@ final class ContentRepository
 
         $compiled = $this->store->get($slug, $version);
 
-        // Nothing compiles a generated page on its own: the pages of a spec
+        // Nothing compiles a generated page on its own: the pages of a source
         // are built together, where the sidebar is. So bring that up to date
         // and look again.
         if (
-            $this->openApi !== null
-            && Mount::owns($slug)
+            $this->sourceFor($slug) !== null
             && ($this->isLocal || ($compiled === null && ! $this->servesBuildOnly($version)))
         ) {
             $this->navigation($version);
@@ -861,12 +988,18 @@ final class ContentRepository
             return $this->pipeline;
         }
 
-        return $this->versionPipelines[$version] ??= new MarkdownPipeline(new MarkdownRenderer(
-            contentPath: $this->contentPath.DIRECTORY_SEPARATOR.$version,
-            appUrl: (string) config('app.url', ''),
-            assetPrefix: $version,
+        return $this->versionPipelines[$version] ??= $this->newPipeline($this->contentPath.DIRECTORY_SEPARATOR.$version, $version);
+    }
+
+    private function newPipeline(string $contentPath, ?string $assetPrefix): MarkdownPipeline
+    {
+        return new MarkdownPipeline(new MarkdownRenderer(
+            contentPath: $contentPath,
+            appUrl: $this->site->appUrl,
+            assetPrefix: $assetPrefix,
             imageReport: $this->imageReport,
-        ));
+            routePrefix: $this->routePrefix,
+        ), $this->site->components);
     }
 
     /**

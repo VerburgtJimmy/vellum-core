@@ -254,6 +254,10 @@ return [
     | Reference pages generated from an OpenAPI 3.0, 3.1 or 3.2 spec: one page per
     | operation, in a sidebar folder per tag, under {route.prefix}/{prefix}.
     |
+    | The reference is jimmyverburgt/vellum-openapi, which jimmyverburgt/vellum
+    | includes. With jimmyverburgt/vellum-core alone, this block does nothing
+    | until that package is required too.
+    |
     | spec: path to a JSON or YAML file. Leave it null to have Scramble write
     | one, when dedoc/scramble is installed.
     |
@@ -271,7 +275,8 @@ return [
     |
     | group_by: tag, or path to group by the first segment of the path.
     |
-    | untagged_label: the folder for operations without a tag.
+    | untagged_label: the folder for operations without a tag. Unset, it is
+    | "Other" in the app's language.
     |
     | samples: languages of the request samples, in tab order. curl, php,
     | javascript and python are built in.
@@ -298,7 +303,7 @@ return [
         'sidebar' => 'separate',
         'title' => 'API reference',
         'group_by' => 'tag',
-        'untagged_label' => 'Other',
+        'untagged_label' => null,
         'samples' => ['curl', 'php', 'javascript', 'python'],
         'base_url' => null,
         'playground' => true,

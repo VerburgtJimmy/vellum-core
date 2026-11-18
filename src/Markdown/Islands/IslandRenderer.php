@@ -7,7 +7,9 @@ namespace Vellum\Markdown\Islands;
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\HtmlString;
 use Vellum\Exceptions\UnknownComponentException;
+use Vellum\Site\Components;
 use Vellum\Support\MarkdownView;
+use Vellum\Support\Translate;
 
 /**
  * Bottom-up Blade render of an island tree. Slot HTML is passed as data, never compiled.
@@ -19,6 +21,10 @@ final class IslandRenderer
         'vellum::config' => 'config',
         'vellum::route' => 'route',
     ];
+
+    public function __construct(
+        private readonly Components $components = new Components,
+    ) {}
 
     /**
      * @param  list<Island>  $islands
@@ -91,7 +97,7 @@ final class IslandRenderer
 
             $this->assertAllowed($child);
 
-            $label = $child->attributes['label'] ?? $child->attributes['title'] ?? 'Tab';
+            $label = $child->attributes['label'] ?? $child->attributes['title'] ?? Translate::line('vellum-core::components.tab');
 
             $items[] = [
                 'id' => $child->attributes['id'] ?? $this->tabId($label),
@@ -128,10 +134,7 @@ final class IslandRenderer
         }
 
         $key = $island->attributes['key'] ?? '';
-        /** @var array<string, mixed> $allowlist */
-        $allowlist = config('vellum.components.allowlist', []);
-        $keys = $allowlist[$kind] ?? [];
-        $keys = is_array($keys) ? $keys : [];
+        $keys = $this->components->allowlist[$kind];
 
         if ($key === '' || ! in_array($key, $keys, true)) {
             throw UnknownComponentException::valueTagRefused($island->name, $key);
@@ -141,17 +144,8 @@ final class IslandRenderer
     private function namespaceAllowed(string $name): bool
     {
         $prefix = str_contains($name, '::') ? explode('::', $name, 2)[0] : '';
-        /** @var mixed $configured */
-        $configured = config('vellum.components.namespaces', ['vellum']);
-        $namespaces = is_array($configured) ? $configured : ['vellum'];
 
-        foreach ($namespaces as $namespace) {
-            if (! is_string($namespace) && ! is_int($namespace)) {
-                continue;
-            }
-
-            $namespace = (string) $namespace;
-
+        foreach ($this->components->namespaces as $namespace) {
             if ($namespace === 'app') {
                 $namespace = '';
             }

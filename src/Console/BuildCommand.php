@@ -26,11 +26,10 @@ final class BuildCommand extends Command
 
     protected $description = 'Compile Markdown docs into the Vellum cache';
 
-    public function handle(): int
+    public function handle(ContentRepository $repository): int
     {
         $started = microtime(true);
 
-        $repository = ContentRepository::fromConfig();
         $version = $this->option('docs-version');
         $version = is_string($version) && $version !== '' ? $version : null;
 
@@ -40,12 +39,20 @@ final class BuildCommand extends Command
             $this->warn('OpenAPI: '.$warning);
         }
 
-        $this->warnAboutShadowedSlugs($documents);
+        // Core alone does not have the reference, and an app that turns it on
+        // should hear what to install rather than find no reference.
+        if ((bool) ($repository->site()->get('openapi')['enabled'] ?? false) && ! in_array('api', $repository->sourceNames(), true)) {
+            $this->warn('vellum.openapi.enabled is on, but the API reference is not installed.');
+            $this->line('  Run composer require jimmyverburgt/vellum-openapi to add it.');
+        }
+
+        $this->warnAboutShadowedSlugs($documents, $repository);
         $this->warnAboutInvalidDates($documents);
 
         $broken = $this->reportBrokenReferences($documents, $repository);
+        $misplaced = $this->reportMisplacedRoots($repository);
 
-        if (SearchDriver::isScout()) {
+        if ($repository->site()->search->isScout()) {
             SearchDriver::assertScoutInstalled();
             // Scout is replaced whole, so it gets every version even when
             // only one was asked for.
@@ -56,7 +63,7 @@ final class BuildCommand extends Command
             $this->line(...),
             $this->warn(...),
             forceCheck: (bool) $this->option('check-search'),
-            strict: $this->strict(),
+            strict: $this->strict($repository),
         ))->run($repository, $documents);
 
         $elapsed = round((microtime(true) - $started) * 1000);
@@ -96,12 +103,13 @@ final class BuildCommand extends Command
             return self::FAILURE;
         }
 
-        if ($broken > 0 && $this->strict()) {
-            $this->error(sprintf(
-                '%d broken reference%s. Fix them, or drop --strict to let the build pass.',
-                $broken,
-                $broken === 1 ? '' : 's',
-            ));
+        if (($broken > 0 || $misplaced > 0) && $this->strict($repository)) {
+            $problems = array_filter([
+                $broken > 0 ? sprintf('%d broken reference%s', $broken, $broken === 1 ? '' : 's') : null,
+                $misplaced > 0 ? sprintf('%d misplaced root%s', $misplaced, $misplaced === 1 ? '' : 's') : null,
+            ]);
+
+            $this->error(implode(' and ', $problems).'. Fix them, or drop --strict to let the build pass.');
 
             return self::FAILURE;
         }
@@ -113,9 +121,9 @@ final class BuildCommand extends Command
      * Strict is a flag for a one-off run and a config key for CI, which does
      * not get to pass flags to whatever the deploy script calls.
      */
-    private function strict(): bool
+    private function strict(ContentRepository $repository): bool
     {
-        return (bool) $this->option('strict') || (bool) config('vellum.checks.strict', false);
+        return (bool) $this->option('strict') || $repository->site()->checks->strict;
     }
 
     /**
@@ -133,7 +141,7 @@ final class BuildCommand extends Command
      */
     private function reportBrokenReferences(array $documents, ContentRepository $repository): int
     {
-        if (! (bool) config('vellum.checks.references', true)) {
+        if (! $repository->site()->checks->references) {
             return 0;
         }
 
@@ -184,11 +192,27 @@ final class BuildCommand extends Command
     }
 
     /**
+     * A sidebar of its own can only be a top-level folder's. Counted with the
+     * broken references, so --strict fails on it the same way.
+     */
+    private function reportMisplacedRoots(ContentRepository $repository): int
+    {
+        $misplaced = $repository->misplacedRoots();
+
+        foreach ($misplaced as $folder) {
+            $this->warn('Folder "'.$folder.'" sets root in its meta.json, but only a top-level folder can have a sidebar of its own.');
+            $this->line('  It is shown as an ordinary folder. Move it to the top level, or remove root.');
+        }
+
+        return count($misplaced);
+    }
+
+    /**
      * @param  list<Document>  $documents
      */
-    private function warnAboutShadowedSlugs(array $documents): void
+    private function warnAboutShadowedSlugs(array $documents, ContentRepository $repository): void
     {
-        if (config('vellum.changelog.path') === null) {
+        if ($repository->site()->changelogPath === null) {
             return;
         }
 
@@ -198,7 +222,7 @@ final class BuildCommand extends Command
             }
 
             $this->warn('Page "'.$document->path.'" is shadowed by the changelog route.');
-            $this->line('  /'.trim((string) config('vellum.route.prefix', 'docs'), '/').'/changelog renders vellum.changelog.path instead.');
+            $this->line('  /'.$repository->site()->routePrefix.'/changelog renders vellum.changelog.path instead.');
             $this->line('  Rename the page, or set vellum.changelog.path to null.');
         }
     }
